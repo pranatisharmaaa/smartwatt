@@ -1,0 +1,391 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+#define WIFI_SSID "Babyelephant_5G"
+#define WIFI_PASSWORD "Mansi@1004"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+#define API_KEY "AIzaSyCjoFWI-kduhIl2RZTzMfBELvEDstLuvIU"
+#define DATABASE_URL "https://smart-watt-83c95-default-rtdb.firebaseio.com"
+// ====================== PIN CONFIG ======================
+int voltagePin = 34;
+int currentPin = 33;
+int relayPin   = 5;
+
+// ====================== CONSTANTS =======================
+const int samples = 3000;
+const int calibrationTimeMs = 15000;
+const int rollingWindow = 10;
+
+// ====================== CALIBRATION =====================
+float voltageCalibration = 0.592;
+float currentCalibration = 0.030;
+
+// ====================== USER SETTINGS ===================
+float monthlyBudget = 1.0;         // ₹
+float runtimeLimitMinutes = 1.0;   // minutes
+bool autoCutoff = true;
+
+// ====================== TRACKING ========================
+float monthlyEnergy_kWh = 0.0;
+float monthlyBill = 0.0;
+
+unsigned long deviceStartTime = 0;
+bool deviceState = true;
+
+bool warning90Sent = false;
+bool criticalSent = false;
+
+// ====================== BASELINE ========================
+bool calibrationActive = true;
+float baselineVoltage = 0;
+float baselineCurrent = 0;
+float baselinePower   = 0;
+int calibrationSamples = 0;
+
+// ====================== ROLLING =========================
+float powerBuffer[rollingWindow];
+float voltageBuffer[rollingWindow];
+int bufferIndex = 0;
+
+// ====================== HEALTH ==========================
+enum HealthState { GREEN, YELLOW, RED };
+HealthState deviceHealth = GREEN;
+
+enum HealthReason {
+  NONE,
+  DEAD_DEVICE,
+  SEVERE_OVERLOAD,
+  VOLTAGE_COLLAPSE,
+  MODERATE_OVERLOAD,
+  POWER_INSTABILITY,
+  VOLTAGE_FLUCTUATION,
+  VAMPIRE_LOAD
+};
+
+HealthReason healthReason = NONE;
+
+// ====================== LIVE VALUES =====================
+float lastVrms = 0;
+float lastIrms = 0;
+float lastPower = 0;
+
+// ====================== BILLING =========================
+float calculateDelhiBill(float units) {
+  if (units <= 200) return units * 3.0;
+  else if (units <= 400) return (200 * 3.0) + (units - 200) * 4.5;
+  else if (units <= 800) return (200 * 3.0) + (200 * 4.5) + (units - 400) * 6.5;
+  else if (units <= 1200) return (200 * 3.0) + (200 * 4.5) + (400 * 6.5) + (units - 800) * 7.0;
+  else return (200 * 3.0) + (200 * 4.5) + (400 * 6.5) + (400 * 7.0) + (units - 1200) * 8.0;
+}
+
+// ====================== RMS =============================
+float measureRMS(int pin) {
+  long sum = 0;
+  long offset = 0;
+
+  for (int i = 0; i < samples; i++)
+    offset += analogRead(pin);
+
+  offset /= samples;
+
+  for (int i = 0; i < samples; i++) {
+    int val = analogRead(pin) - offset;
+    sum += (long)val * val;
+  }
+
+  return sqrt(sum / (float)samples);
+}
+
+// ====================== HEALTH ENGINE ===================
+void updateHealth(float Vrms, float Irms, float power) {
+
+  if (calibrationActive) return;
+
+  float rollingPower = 0;
+  float rollingVoltage = 0;
+
+  for (int i = 0; i < rollingWindow; i++) {
+    rollingPower += powerBuffer[i];
+    rollingVoltage += voltageBuffer[i];
+  }
+
+  rollingPower /= rollingWindow;
+  rollingVoltage /= rollingWindow;
+
+  deviceHealth = GREEN;
+  healthReason = NONE;
+
+  if (deviceState && Irms < 0.1 * baselineCurrent) {
+    deviceHealth = RED;
+    healthReason = DEAD_DEVICE;
+    return;
+  }
+
+  if (power > 2.0 * baselinePower) {
+    deviceHealth = RED;
+    healthReason = SEVERE_OVERLOAD;
+    return;
+  }
+
+  if (Vrms < 0.75 * baselineVoltage) {
+    deviceHealth = RED;
+    healthReason = VOLTAGE_COLLAPSE;
+    return;
+  }
+
+  if (power > 1.3 * baselinePower) {
+    deviceHealth = YELLOW;
+    healthReason = MODERATE_OVERLOAD;
+    return;
+  }
+
+  if (abs(power - rollingPower) > 0.4 * baselinePower) {
+    deviceHealth = YELLOW;
+    healthReason = POWER_INSTABILITY;
+    return;
+  }
+
+  if (abs(Vrms - baselineVoltage) > 0.1 * baselineVoltage) {
+    deviceHealth = YELLOW;
+    healthReason = VOLTAGE_FLUCTUATION;
+    return;
+  }
+
+  if (!deviceState && Irms > 0.05 * baselineCurrent) {
+    deviceHealth = YELLOW;
+    healthReason = VAMPIRE_LOAD;
+    return;
+  }
+}
+
+String reasonString() {
+  switch (healthReason) {
+    case DEAD_DEVICE: return "Dead Device";
+    case SEVERE_OVERLOAD: return "Severe Overload";
+    case VOLTAGE_COLLAPSE: return "Voltage Collapse";
+    case MODERATE_OVERLOAD: return "Moderate Overload";
+    case POWER_INSTABILITY: return "Power Instability";
+    case VOLTAGE_FLUCTUATION: return "Voltage Fluctuation";
+    case VAMPIRE_LOAD: return "Vampire Load";
+    default: return "Normal";
+  }
+}
+
+// ====================== TIME LEFT =======================
+void printTimeLeft() {
+
+  if (!deviceState) {
+    Serial.println("Time Left: Device OFF");
+    return;
+  }
+
+  float elapsed = (millis() - deviceStartTime) / 60000.0;
+  float remaining = runtimeLimitMinutes - elapsed;
+
+  if (remaining <= 0) {
+    Serial.println("Time Left: 00:00:00");
+    return;
+  }
+
+  long totalSeconds = remaining * 60;
+
+  int hours = totalSeconds / 3600;
+  int minutes = (totalSeconds % 3600) / 60;
+  int seconds = totalSeconds % 60;
+
+  Serial.print("Time Left: ");
+  if (hours < 10) Serial.print("0");
+  Serial.print(hours); Serial.print(":");
+  if (minutes < 10) Serial.print("0");
+  Serial.print(minutes); Serial.print(":");
+  if (seconds < 10) Serial.print("0");
+  Serial.println(seconds);
+}
+
+// ====================== STATUS ==========================
+void printStatus() {
+
+  Serial.println("=========== DEVICE 1 STATUS ===========");
+
+  Serial.print("State: ");
+  Serial.println(deviceState ? "ON" : "OFF");
+
+  Serial.print("Health: ");
+  if (deviceHealth == GREEN) Serial.print("GREEN");
+  else if (deviceHealth == YELLOW) Serial.print("YELLOW");
+  else Serial.print("RED");
+
+  Serial.print(" | Reason: ");
+  Serial.println(reasonString());
+
+  Serial.print("Budget: ₹");
+  Serial.print(monthlyBudget);
+  Serial.print(" | Timer: ");
+  Serial.print(runtimeLimitMinutes);
+  Serial.println(" min");
+
+  printTimeLeft();
+
+  Serial.print("Voltage: "); Serial.println(lastVrms);
+  Serial.print("Current: "); Serial.println(lastIrms);
+  Serial.print("Power: "); Serial.println(lastPower);
+
+  Serial.print("Monthly Units: ");
+  Serial.println(monthlyEnergy_kWh, 6);
+
+  Serial.print("Monthly Bill: ₹");
+  Serial.println(monthlyBill, 4);
+
+  Serial.println("========================================");
+}
+
+// ====================== SERIAL ==========================
+void handleSerial(String cmd) {
+  cmd.trim();
+
+  if (cmd == "ON") {
+    deviceState = true;
+    calibrationActive = true;
+    calibrationSamples = 0;
+    baselineVoltage = baselineCurrent = baselinePower = 0;
+    deviceStartTime = millis();
+    warning90Sent = false;
+    criticalSent = false;
+    Serial.println("DEVICE 1 ON - Learning Baseline");
+  }
+
+  else if (cmd == "OFF") {
+    deviceState = false;
+    Serial.println("DEVICE 1 OFF");
+  }
+
+  else if (cmd == "RESET") {
+    monthlyEnergy_kWh = 0;
+    monthlyBill = 0;
+    deviceStartTime = millis();
+    warning90Sent = false;
+    criticalSent = false;
+    Serial.println("System Reset");
+  }
+
+  else if (cmd.startsWith("SETTIME")) {
+    runtimeLimitMinutes = cmd.substring(7).toFloat();
+    Serial.println("Timer Updated");
+  }
+
+  else if (cmd.startsWith("SETBUDGET")) {
+    monthlyBudget = cmd.substring(10).toFloat();
+    Serial.println("Budget Updated");
+  }
+
+  else if (cmd == "AUTOON") {
+    autoCutoff = true;
+    Serial.println("Auto Cutoff Enabled");
+  }
+
+  else if (cmd == "AUTOOFF") {
+    autoCutoff = false;
+    Serial.println("Auto Cutoff Disabled");
+  }
+
+  else if (cmd == "STATUS") {
+    printStatus();
+  }
+}
+
+// ====================== SETUP ===========================
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println("Connected to WiFi");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);
+  deviceStartTime = millis();
+  Serial.println("System Ready");
+  
+}
+
+// ====================== LOOP ============================
+void loop() {
+
+  if (Serial.available())
+    handleSerial(Serial.readStringUntil('\n'));
+
+  digitalWrite(relayPin, deviceState ? HIGH : LOW);
+
+  float Vrms = measureRMS(voltagePin) * voltageCalibration;
+  float Irms = measureRMS(currentPin) * currentCalibration;
+  float power = Vrms * Irms;
+
+  lastVrms = Vrms;
+  lastIrms = Irms;
+  lastPower = power;
+
+  if (deviceState)
+    monthlyEnergy_kWh += (power / 3600.0) / 1000.0;
+
+  monthlyBill = calculateDelhiBill(monthlyEnergy_kWh);
+
+  if (!warning90Sent && monthlyBill >= 0.9 * monthlyBudget) {
+    Serial.println("⚠ 90% Budget Warning");
+    warning90Sent = true;
+  }
+
+  if (!criticalSent && monthlyBill >= monthlyBudget) {
+    Serial.println("🚨 Budget Exceeded");
+    criticalSent = true;
+    if (autoCutoff) deviceState = false;
+  }
+
+  float runtimeMinutes = (millis() - deviceStartTime) / 60000.0;
+  if (deviceState && runtimeMinutes >= runtimeLimitMinutes) {
+    Serial.println("⏱ Timer Limit Exceeded");
+    if (autoCutoff) deviceState = false;
+  }
+
+  if (deviceState && calibrationActive) {
+    baselineVoltage += Vrms;
+    baselineCurrent += Irms;
+    baselinePower += power;
+    calibrationSamples++;
+
+    if (millis() - deviceStartTime >= calibrationTimeMs) {
+      baselineVoltage /= calibrationSamples;
+      baselineCurrent /= calibrationSamples;
+      baselinePower /= calibrationSamples;
+      calibrationActive = false;
+      Serial.println("Baseline Learned");
+    }
+  }
+
+  powerBuffer[bufferIndex] = power;
+  voltageBuffer[bufferIndex] = Vrms;
+  bufferIndex = (bufferIndex + 1) % rollingWindow;
+
+  updateHealth(Vrms, Irms, power);
+
+  Firebase.RTDB.setFloat(&fbdo, "/device1/voltage", Vrms);
+  Firebase.RTDB.setFloat(&fbdo, "/device1/current", Irms);
+  Firebase.RTDB.setFloat(&fbdo, "/device1/power", power);
+  Firebase.RTDB.setFloat(&fbdo, "/device1/bill", monthlyBill);
+  Firebase.RTDB.setFloat(&fbdo, "/device1/units", monthlyEnergy_kWh);
+  
+  delay(1000);
+}
